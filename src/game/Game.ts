@@ -8,6 +8,10 @@ import { ObstacleSpawner } from './terrain/ObstacleSpawner';
 import { AssetManager } from './assets/AssetManager';
 import { Player } from './entities/Player';
 import { CollisionDetector } from './physics/CollisionDetector';
+import { SnowTrail } from './effects/SnowTrail';
+import { SnowParticles } from './effects/SnowParticles';
+import type { PhysicsSettings } from './physicsSettings';
+import { DEFAULT_PHYSICS_SETTINGS, resolvePhysicsSettings } from './physicsSettings';
 import type { GameStateType, GameUIState } from './types';
 
 export type UIStateCallback = (state: GameUIState) => void;
@@ -21,22 +25,26 @@ export class Game {
   private assetManager: AssetManager;
   private player!: Player;
   private collisionDetector: CollisionDetector;
+  private snowTrail!: SnowTrail;
+  private snowParticles!: SnowParticles;
 
   private clock = new THREE.Clock(false);
   private animFrameId: number | null = null;
   private gameState: GameStateType = 'MENU';
   private distance = 0;
   private score = 0;
+  private physicsSettings: PhysicsSettings;
 
   private onUIStateChange: UIStateCallback | null = null;
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(canvas: HTMLCanvasElement, physicsSettings: PhysicsSettings = DEFAULT_PHYSICS_SETTINGS) {
     this.renderer = new Renderer(canvas);
     this.gameScene = new GameScene();
     this.camera = new GameCamera();
     this.inputManager = new InputManager(canvas);
     this.assetManager = new AssetManager();
     this.collisionDetector = new CollisionDetector();
+    this.physicsSettings = { ...physicsSettings };
 
     this.init();
 
@@ -49,10 +57,12 @@ export class Game {
   private init() {
     const playerMesh = this.assetManager.create('player');
     this.gameScene.add(playerMesh);
-    this.player = new Player(playerMesh);
+    this.player = new Player(playerMesh, resolvePhysicsSettings(this.physicsSettings));
 
     const spawner = new ObstacleSpawner(this.assetManager);
     this.terrainManager = new TerrainManager(this.gameScene.scene, spawner);
+    this.snowTrail = new SnowTrail(this.gameScene.scene, this.terrainManager);
+    this.snowParticles = new SnowParticles(this.gameScene.scene, this.terrainManager);
 
     const groundY = this.terrainManager.getHeightAt(0, 0);
     this.player.position.y = groundY;
@@ -69,6 +79,11 @@ export class Game {
   setUIStateCallback(callback: UIStateCallback) {
     this.onUIStateChange = callback;
     this.emitUIState();
+  }
+
+  setPhysicsSettings(settings: PhysicsSettings) {
+    this.physicsSettings = { ...settings };
+    this.player.setPhysicsSettings(resolvePhysicsSettings(this.physicsSettings));
   }
 
   private emitUIState() {
@@ -119,6 +134,8 @@ export class Game {
     this.score = 0;
     this.player.reset();
     this.terrainManager.reset();
+    this.snowTrail.reset();
+    this.snowParticles.reset();
 
     const groundY = this.terrainManager.getHeightAt(0, 0);
     this.player.position.y = groundY;
@@ -155,8 +172,16 @@ export class Game {
     // Player movement
     this.player.update(dt, this.inputManager.state, this.terrainManager);
 
+    if (this.player.health <= 0) {
+      this.gameOver();
+      return;
+    }
+
     // Terrain chunk recycling
     this.terrainManager.update(this.player.position.z);
+
+    this.snowTrail.update(this.player);
+    this.snowParticles.update(dt, this.player);
 
     // Collisions
     const obstacles = this.terrainManager.getActiveObstacles(this.player.position.z);
@@ -197,6 +222,8 @@ export class Game {
     if (this.animFrameId !== null) {
       cancelAnimationFrame(this.animFrameId);
     }
+    this.snowTrail.dispose(this.gameScene.scene);
+    this.snowParticles.dispose(this.gameScene.scene);
     this.renderer.dispose();
   }
 }

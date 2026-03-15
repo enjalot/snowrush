@@ -11,8 +11,9 @@
   "dependencies": {
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "simplex-noise": "^4.0.3",
     "three": "^0.170.0",
-    "simplex-noise": "^4.0.3"
+    "unique-names-generator": "^4.7.1"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

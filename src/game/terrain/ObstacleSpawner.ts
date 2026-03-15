@@ -17,7 +17,7 @@ export class ObstacleSpawner {
     const zEnd = chunk.zEnd;
 
     // Trees along edges (higher density outside trail)
-    const treeCount = Math.floor(randomRange(6, 12));
+    const treeCount = Math.floor(randomRange(9, 17));
     for (let i = 0; i < treeCount; i++) {
       let x: number;
       if (Math.random() < 0.3) {
@@ -33,7 +33,7 @@ export class ObstacleSpawner {
     }
 
     // Rocks (medium density, mostly in trail)
-    const rockCount = Math.floor(randomRange(2, 5));
+    const rockCount = Math.floor(randomRange(3, 7));
     for (let i = 0; i < rockCount; i++) {
       const x = randomRange(-TRAIL_HALF_WIDTH * 0.8, TRAIL_HALF_WIDTH * 0.8);
       const z = randomRange(zEnd + 5, zStart - 5);

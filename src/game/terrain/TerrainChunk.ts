@@ -1,5 +1,16 @@
 import * as THREE from 'three';
-import { CHUNK_WIDTH, CHUNK_DEPTH, SEGMENTS_X, SEGMENTS_Z, NOISE_SCALE, NOISE_AMPLITUDE, getSlopeGradeAt } from './TerrainConfig';
+import {
+  CHUNK_WIDTH,
+  CHUNK_DEPTH,
+  SEGMENTS_X,
+  SEGMENTS_Z,
+  NOISE_SCALE,
+  NOISE_AMPLITUDE,
+  TALL_HILL_NOISE_SCALE,
+  TALL_HILL_AMPLITUDE,
+  TALL_HILL_RARITY,
+  getSlopeGradeAt,
+} from './TerrainConfig';
 import { simplex2 } from '../utils/noise';
 import type { ObstacleData } from '../types';
 
@@ -19,8 +30,9 @@ export class TerrainChunk {
     this.geometry.rotateX(-Math.PI / 2);
 
     const material = new THREE.MeshStandardMaterial({
-      color: 0xf0f5ff,
-      roughness: 0.8,
+      color: 0xf4f8ff,
+      roughness: 0.92,
+      metalness: 0,
       flatShading: false,
     });
 
@@ -52,8 +64,17 @@ export class TerrainChunk {
       // Slope: Y decreases as Z goes negative (downhill)
       // Slope grade increases with distance for progressive difficulty
       const slopeY = worldZ * getSlopeGradeAt(worldZ);
-      // Noise for bumps
-      const noiseY = simplex2(worldX * NOISE_SCALE, worldZ * NOISE_SCALE) * NOISE_AMPLITUDE;
+      // Base rolling terrain with occasional taller hill clusters.
+      const baseNoise = simplex2(worldX * NOISE_SCALE, worldZ * NOISE_SCALE) * NOISE_AMPLITUDE;
+      const tallHillMask = Math.pow(
+        Math.max(0, simplex2(worldX * TALL_HILL_NOISE_SCALE + 19.4, worldZ * TALL_HILL_NOISE_SCALE - 7.2) * 0.5 + 0.5),
+        TALL_HILL_RARITY,
+      );
+      const tallHillShape = Math.max(
+        0,
+        simplex2(worldX * (NOISE_SCALE * 0.75) - 43.1, worldZ * (NOISE_SCALE * 0.75) + 11.8) * 0.5 + 0.5,
+      );
+      const noiseY = baseNoise + tallHillMask * tallHillShape * TALL_HILL_AMPLITUDE;
 
       pos.setY(i, slopeY + noiseY);
     }

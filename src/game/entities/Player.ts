@@ -1,22 +1,19 @@
 import * as THREE from 'three';
 import type { InputState, TrickType, CharacterRig } from '../types';
 import type { TerrainManager } from '../terrain/TerrainManager';
-import { clamp, lerp } from '../utils/math';
+import type { ResolvedPhysicsSettings } from '../physicsSettings';
+import { clamp, lerp, remap } from '../utils/math';
 import { CHUNK_WIDTH } from '../terrain/TerrainConfig';
 
 // Physics constants
-const GRAVITY = 20;
-const STEER_SPEED = 2.5;
-const MAX_STEER = Math.PI / 4;
-const STEER_FRICTION = 3.0;
-const ACCEL_FORCE = 8;
-const MAX_SPEED = 60;
+const BOARD_LEAN_RESPONSE = 8;
+const MAX_BOARD_LEAN = Math.PI / 6;
+const FAST_TRAVEL_ANGLE = Math.PI / 4;
+const MAX_TRAVEL_ANGLE = Math.PI / 2 - 0.05;
+const HORIZONTAL_SPEED_FACTOR = 0.35;
 const MIN_SPEED = 5;
-const DRAG = 0.3;
-const BASE_SLOPE_ACCEL = 6;
 
 // Pump constants
-const PUMP_POP_FORCE = 2.5;
 const PUMP_SPEED_BOOST = 3;
 const PUMP_ABSORB_SPEED_BOOST = 2;
 const PUMP_SLOPE_BONUS = 6;
@@ -32,7 +29,7 @@ const LANDING_TOLERANCE = Math.PI / 4; // ±45° from upright to land cleanly
 const SLOPE_RAMP_RATE = 0.0003; // slope accel increase per meter of distance
 const MIN_SPEED_RAMP = 0.002;   // min speed increase per meter of distance
 const MAX_SPEED_RAMP = 0.002;   // max speed increase per meter
-const MAX_SPEED_CAP = 80;       // absolute ceiling
+const MAX_SPEED_CAP_DELTA = 20; // absolute headroom above configured max speed
 
 // Flip landing zones (measured as deviation from upright: 0 = flat, PI = upside-down)
 const FLIP_CLEAN_ZONE = Math.PI / 4;      // ±45° from flat = clean landing
@@ -50,47 +47,61 @@ const FB_FLASH_DECAY = 3; // per second
 interface PoseTargets {
   hipsY: number;
   spineX: number;
-  armLZ: number;  armRZ: number;
+  armLX: number;  armRX: number;
   elbowLX: number; elbowRX: number;
   hipLX: number;  hipRX: number;
   kneeLX: number; kneeRX: number;
 }
 
 const POSE_STANDING: PoseTargets = {
-  hipsY: 0.6,
-  spineX: 0.1,
-  armLZ: 0.3,   armRZ: -0.3,
-  elbowLX: -0.5, elbowRX: -0.5,
+  hipsY: 0.65,
+  spineX: 0.08,
+  armLX: 0.2,   armRX: 0.2,
+  elbowLX: -0.45, elbowRX: -0.45,
   hipLX: 0.15,  hipRX: 0.15,
   kneeLX: -0.3, kneeRX: -0.3,
 };
 
 const POSE_CROUCHING: PoseTargets = {
-  hipsY: 0.42,
-  spineX: 0.3,
-  armLZ: 0.6,   armRZ: -0.6,
-  elbowLX: -1.0, elbowRX: -1.0,
+  hipsY: 0.5,
+  spineX: 0.45,
+  armLX: 0.55,  armRX: 0.55,
+  elbowLX: -0.95, elbowRX: -0.95,
   hipLX: 0.8,   hipRX: 0.8,
-  kneeLX: -1.4,  kneeRX: -1.4,
+  kneeLX: -1.35, kneeRX: -1.35,
 };
 
 const POSE_AIRBORNE: PoseTargets = {
-  hipsY: 0.6,
-  spineX: 0.0,
-  armLZ: 0.8,   armRZ: -0.8,
+  hipsY: 0.65,
+  spineX: 0.02,
+  armLX: -0.15, armRX: -0.15,
   elbowLX: -0.2, elbowRX: -0.2,
   hipLX: 0.05,  hipRX: 0.05,
   kneeLX: -0.15, kneeRX: -0.15,
 };
 
 const POSE_LERP_SPEED = 8;
+const OUT_OF_BOUNDS_FALL_TIME = 5;
+const SNOW_CONTACT_FULL = 0.06;
+const SNOW_CONTACT_CUTOFF = 0.32;
+
+function wrapAngle(angle: number): number {
+  return Math.atan2(Math.sin(angle), Math.cos(angle));
+}
+
+function normalizeTravelAngle(boardAngle: number): number {
+  let travelAngle = wrapAngle(boardAngle);
+  if (travelAngle > Math.PI / 2) travelAngle -= Math.PI;
+  if (travelAngle < -Math.PI / 2) travelAngle += Math.PI;
+  return clamp(travelAngle, -MAX_TRAVEL_ANGLE, MAX_TRAVEL_ANGLE);
+}
 
 export class Player {
   mesh: THREE.Group;
   position = new THREE.Vector3(0, 0, 0);
   velocity = new THREE.Vector3(0, 0, 0);
   speed = 10;
-  steerAngle = 0;
+  boardAngle = 0;
   airborne = false;
   health = 3;
   invulnerable = false;
@@ -113,6 +124,11 @@ export class Player {
   private invulnerableTimer = 0;
   private invulnerableDuration = 1.5;
   private blinkTimer = 0;
+  private outOfBoundsTimer = 0;
+  private boardLean = 0;
+  private carveIntensity = 0;
+  private carveSign = 0;
+  private snowContact = 0;
 
   // Board visual feedback
   private boardMat: THREE.MeshStandardMaterial | null = null;
@@ -122,9 +138,11 @@ export class Player {
   // Character rig & pose animation
   private rig: CharacterRig | null = null;
   private currentPose: PoseTargets = { ...POSE_STANDING };
+  private physics: ResolvedPhysicsSettings;
 
-  constructor(mesh: THREE.Group) {
+  constructor(mesh: THREE.Group, physics: ResolvedPhysicsSettings) {
     this.mesh = mesh;
+    this.physics = physics;
 
     // Find the board mesh for visual feedback
     const boardMesh = mesh.getObjectByName('board') as THREE.Mesh | undefined;
@@ -141,7 +159,7 @@ export class Player {
   /** Current effective slope acceleration — increases with distance */
   private get slopeAccel(): number {
     const dist = Math.abs(this.position.z);
-    return BASE_SLOPE_ACCEL + dist * SLOPE_RAMP_RATE;
+    return this.physics.slopeAccel + dist * SLOPE_RAMP_RATE;
   }
 
   /** Minimum speed floor — rises with distance so the game gets faster */
@@ -153,28 +171,105 @@ export class Player {
   /** Maximum speed ceiling — rises slightly with distance */
   private get maxSpeed(): number {
     const dist = Math.abs(this.position.z);
-    return Math.min(MAX_SPEED + dist * MAX_SPEED_RAMP, MAX_SPEED_CAP);
+    return Math.min(
+      this.physics.maxSpeed + dist * MAX_SPEED_RAMP,
+      this.physics.maxSpeed + MAX_SPEED_CAP_DELTA,
+    );
+  }
+
+  setPhysicsSettings(physics: ResolvedPhysicsSettings) {
+    this.physics = physics;
+    this.speed = clamp(this.speed, this.minSpeed, this.maxSpeed);
+  }
+
+  private get travelAngle(): number {
+    return normalizeTravelAngle(this.boardAngle);
+  }
+
+  get grounded(): boolean {
+    return !this.airborne;
+  }
+
+  get outOfBounds(): boolean {
+    return this.outOfBoundsTimer > 0;
+  }
+
+  get speedRatio(): number {
+    const range = Math.max(1, this.maxSpeed - this.minSpeed);
+    return clamp((this.speed - this.minSpeed) / range, 0, 1);
+  }
+
+  get carveSprayIntensity(): number {
+    return this.carveIntensity * this.snowContact;
+  }
+
+  get carveDirection(): number {
+    return this.carveSign;
+  }
+
+  get snowContactAmount(): number {
+    return this.snowContact;
+  }
+
+  getRideDirection(target = new THREE.Vector3()): THREE.Vector3 {
+    return target.set(
+      Math.sin(this.travelAngle),
+      0,
+      -Math.cos(this.travelAngle),
+    );
+  }
+
+  private get travelSpeedFactor(): number {
+    const absTravelAngle = Math.abs(this.travelAngle);
+    if (absTravelAngle <= FAST_TRAVEL_ANGLE) return 1;
+    return remap(
+      absTravelAngle,
+      FAST_TRAVEL_ANGLE,
+      MAX_TRAVEL_ANGLE,
+      1,
+      HORIZONTAL_SPEED_FACTOR,
+    );
   }
 
   update(dt: number, input: InputState, terrainManager: TerrainManager) {
+    if (this.outOfBounds) {
+      this.snowContact = 0;
+      this.updateOutOfBoundsFall(dt);
+      return;
+    }
+
+    const previousBoardAngle = this.boardAngle;
+
     // --- Steering (ONLY on ground — no air steering) ---
     if (!this.airborne) {
-      this.steerAngle += input.steer * STEER_SPEED * dt;
-      this.steerAngle = clamp(this.steerAngle, -MAX_STEER, MAX_STEER);
-      this.steerAngle *= (1 - STEER_FRICTION * dt);
+      this.boardAngle = wrapAngle(this.boardAngle + input.steer * this.physics.turnSpeed * dt);
     }
+
+    const leanTarget = this.airborne ? 0 : input.steer * MAX_BOARD_LEAN;
+    const leanT = 1 - Math.exp(-BOARD_LEAN_RESPONSE * dt);
+    this.boardLean = lerp(this.boardLean, leanTarget, leanT);
 
     // --- Speed: progressive slope accel + input + drag ---
     this.speed += this.slopeAccel * dt;
     if (!this.airborne) {
-      this.speed += input.accelerate * ACCEL_FORCE * dt;
+      this.speed += input.accelerate * this.physics.acceleration * dt;
     }
-    this.speed -= this.speed * DRAG * dt;
+    this.speed -= this.speed * this.physics.drag * dt;
     this.speed = clamp(this.speed, this.minSpeed, this.maxSpeed);
 
+    const boardTurnDelta = wrapAngle(this.boardAngle - previousBoardAngle);
+    const turnRate = Math.abs(boardTurnDelta) / Math.max(dt, 1e-4);
+    const carveTarget = this.airborne
+      ? 0
+      : remap(turnRate * (0.25 + this.speedRatio * 0.75), 0.12, 1.4, 0, 1);
+    const carveT = 1 - Math.exp(-10 * dt);
+    this.carveIntensity = lerp(this.carveIntensity, carveTarget, carveT);
+    this.carveSign = Math.abs(boardTurnDelta) > 1e-4 ? Math.sign(boardTurnDelta) : 0;
+
     // --- Velocity direction ---
-    this.velocity.z = -this.speed * Math.cos(this.steerAngle);
-    this.velocity.x = this.speed * Math.sin(this.steerAngle);
+    const travelSpeed = this.speed * this.travelSpeedFactor;
+    this.velocity.z = -travelSpeed * Math.cos(this.travelAngle);
+    this.velocity.x = travelSpeed * Math.sin(this.travelAngle);
 
     // --- Compute terrain slope ---
     const hHere = terrainManager.getHeightAt(this.position.x, this.position.z);
@@ -200,7 +295,7 @@ export class Player {
     if (!input.jumpHeld && this.isPumping && !this.airborne) {
       this.isPumping = false;
       if (!this.absorbedLanding) {
-        this.velocity.y = PUMP_POP_FORCE;
+        this.velocity.y = this.physics.popForce;
         this.airborne = true;
         const slopeBonus = Math.min(this.pumpSlopeAccum * PUMP_SLOPE_BONUS, 6);
         this.speed += PUMP_SPEED_BOOST + slopeBonus;
@@ -219,12 +314,18 @@ export class Player {
     this.lastSlope = currentSlope;
 
     // --- Gravity ---
-    this.velocity.y -= GRAVITY * dt;
+    this.velocity.y -= this.physics.gravity * dt;
 
     // --- Integrate position ---
     this.position.x += this.velocity.x * dt;
     this.position.y += this.velocity.y * dt;
     this.position.z += this.velocity.z * dt;
+
+    const halfWidth = CHUNK_WIDTH / 2;
+    if (Math.abs(this.position.x) > halfWidth) {
+      this.startOutOfBoundsFall();
+      return;
+    }
 
     // --- Terrain following ---
     const groundY = terrainManager.getHeightAt(this.position.x, this.position.z);
@@ -238,9 +339,10 @@ export class Player {
       this.velocity.y = 0;
     }
 
-    // --- Lateral bounds ---
-    const halfWidth = CHUNK_WIDTH / 2 - 1;
-    this.position.x = clamp(this.position.x, -halfWidth, halfWidth);
+    const clearance = Math.max(0, this.position.y - groundY);
+    const snowContactTarget = remap(clearance, SNOW_CONTACT_FULL, SNOW_CONTACT_CUTOFF, 1, 0);
+    const snowContactT = 1 - Math.exp(-18 * dt);
+    this.snowContact = lerp(this.snowContact, snowContactTarget, snowContactT);
 
     // --- Invulnerability ---
     if (this.invulnerable) {
@@ -268,9 +370,9 @@ export class Player {
       // Show trick rotation on the mesh
       this.mesh.rotation.set(this.flipAngle, this.spinAngle, 0);
     } else {
-      this.mesh.rotation.y = this.steerAngle;
+      this.mesh.rotation.y = -this.boardAngle;
       this.mesh.rotation.x = 0;
-      this.mesh.rotation.z = this.steerAngle * 0.3;  // reversed for snowboard carve lean
+      this.mesh.rotation.z = this.boardLean;
     }
 
     // Animate limb poses (crouch, airborne, standing)
@@ -280,34 +382,60 @@ export class Player {
     this.updateBoardFeedback(dt);
   }
 
+  private updateOutOfBoundsFall(dt: number) {
+    this.snowContact = 0;
+    this.outOfBoundsTimer = Math.max(0, this.outOfBoundsTimer - dt);
+    this.velocity.y -= this.physics.gravity * dt;
+    this.position.addScaledVector(this.velocity, dt);
+
+    if (this.trickFlashTimer > 0) {
+      this.trickFlashTimer -= dt;
+      if (this.trickFlashTimer <= 0) {
+        this.pendingTrickName = null;
+      }
+    }
+
+    this.mesh.position.copy(this.position);
+    this.mesh.rotation.set(this.flipAngle, this.spinAngle, 0);
+    this.updatePose(dt);
+    this.updateBoardFeedback(dt);
+
+    if (this.outOfBoundsTimer <= 0) {
+      this.health = 0;
+      this.speed = 0;
+      this.pendingTrickName = 'OUT OF BOUNDS!';
+      this.trickFlashTimer = 1.5;
+    }
+  }
+
   // --- Trick system ---
 
   private updateTricks(dt: number, input: InputState) {
     // Spins: A/D while airborne (steer keys)
     if (input.steer !== 0 && !this.currentTrick) {
       this.currentTrick = input.steer < 0 ? 'spin-left' : 'spin-right';
-      this.trickStartSteerAngle = this.steerAngle;
-      this.spinAngle = this.steerAngle;
+      this.trickStartSteerAngle = -this.boardAngle;
+      this.spinAngle = -this.boardAngle;
       this.flipAngle = 0;
     }
 
     // Flips: W/S while airborne (no spacebar needed)
     if (input.accelerate !== 0 && !this.currentTrick) {
-      this.currentTrick = input.accelerate > 0 ? 'backflip' : 'frontflip';
+      this.currentTrick = input.accelerate > 0 ? 'frontflip' : 'backflip';
       this.flipAngle = 0;
-      this.spinAngle = this.steerAngle;
-      this.trickStartSteerAngle = this.steerAngle;
+      this.spinAngle = -this.boardAngle;
+      this.trickStartSteerAngle = -this.boardAngle;
     }
 
     // Animate the trick rotation — only while key is held (for controlled landings)
     if (this.currentTrick === 'spin-left') {
-      if (input.steer < 0) this.spinAngle -= SPIN_SPEED * dt;
+      if (input.steer < 0) this.spinAngle += SPIN_SPEED * dt;
     } else if (this.currentTrick === 'spin-right') {
-      if (input.steer > 0) this.spinAngle += SPIN_SPEED * dt;
+      if (input.steer > 0) this.spinAngle -= SPIN_SPEED * dt;
     } else if (this.currentTrick === 'frontflip') {
-      if (input.accelerate < 0) this.flipAngle -= FLIP_SPEED * dt;
+      if (input.accelerate > 0) this.flipAngle -= FLIP_SPEED * dt;
     } else if (this.currentTrick === 'backflip') {
-      if (input.accelerate > 0) this.flipAngle += FLIP_SPEED * dt;
+      if (input.accelerate < 0) this.flipAngle += FLIP_SPEED * dt;
     }
   }
 
@@ -320,6 +448,8 @@ export class Player {
       const absAngle = Math.abs(angle);
 
       if (isSpin) {
+        this.boardAngle = wrapAngle(-this.spinAngle);
+
         // Spins: 180° increments are valid landings (180, 360, 540, etc.)
         const halfRemainder = absAngle % Math.PI;
         const cleanHalf = halfRemainder < LANDING_TOLERANCE ||
@@ -346,7 +476,9 @@ export class Player {
         // deviation: 0 = flat/upright, PI = upside-down
         const remainder = absAngle % (Math.PI * 2);
         const deviation = remainder > Math.PI ? Math.PI * 2 - remainder : remainder;
-        const fullRotations = Math.floor(absAngle / (Math.PI * 2));
+        const fullRotations = deviation < FLIP_CLEAN_ZONE
+          ? Math.round(absAngle / (Math.PI * 2))
+          : Math.floor(absAngle / (Math.PI * 2));
 
         if (deviation < FLIP_CLEAN_ZONE) {
           // Clean zone (within ±45° of flat) — award points
@@ -403,6 +535,22 @@ export class Player {
     this.flashBoard(FB_RED);
   }
 
+  private startOutOfBoundsFall() {
+    this.outOfBoundsTimer = OUT_OF_BOUNDS_FALL_TIME;
+    this.airborne = true;
+    this.snowContact = 0;
+    this.invulnerable = false;
+    this.isPumping = false;
+    this.absorbedLanding = false;
+    this.pumpSlopeAccum = 0;
+    this.currentTrick = null;
+    this.spinAngle = 0;
+    this.flipAngle = 0;
+    this.pendingTrickName = 'OUT OF BOUNDS!';
+    this.trickFlashTimer = 1.5;
+    this.flashBoard(FB_RED);
+  }
+
   launch(force: number) {
     if (!this.airborne) {
       this.velocity.y = force;
@@ -432,8 +580,8 @@ export class Player {
     // Lerp all values toward target
     this.currentPose.hipsY = lerp(this.currentPose.hipsY, target.hipsY, t);
     this.currentPose.spineX = lerp(this.currentPose.spineX, target.spineX, t);
-    this.currentPose.armLZ = lerp(this.currentPose.armLZ, target.armLZ, t);
-    this.currentPose.armRZ = lerp(this.currentPose.armRZ, target.armRZ, t);
+    this.currentPose.armLX = lerp(this.currentPose.armLX, target.armLX, t);
+    this.currentPose.armRX = lerp(this.currentPose.armRX, target.armRX, t);
     this.currentPose.elbowLX = lerp(this.currentPose.elbowLX, target.elbowLX, t);
     this.currentPose.elbowRX = lerp(this.currentPose.elbowRX, target.elbowRX, t);
     this.currentPose.hipLX = lerp(this.currentPose.hipLX, target.hipLX, t);
@@ -447,15 +595,17 @@ export class Player {
     this.rig.spine.rotation.x = 0;
     this.rig.spine.rotation.z = -this.currentPose.spineX;
 
-    this.rig.leftArm.rotation.z = this.currentPose.armLZ;
-    this.rig.rightArm.rotation.z = this.currentPose.armRZ;
+    this.rig.leftArm.rotation.x = this.currentPose.armLX;
+    this.rig.rightArm.rotation.x = this.currentPose.armRX;
+    this.rig.leftArm.rotation.z = 0;
+    this.rig.rightArm.rotation.z = 0;
     this.rig.leftForeArm.rotation.x = this.currentPose.elbowLX;
     this.rig.rightForeArm.rotation.x = this.currentPose.elbowRX;
 
-    this.rig.leftUpLeg.rotation.x = this.currentPose.hipLX;
-    this.rig.rightUpLeg.rotation.x = this.currentPose.hipRX;
-    this.rig.leftLeg.rotation.x = this.currentPose.kneeLX;
-    this.rig.rightLeg.rotation.x = this.currentPose.kneeRX;
+    this.rig.leftUpLeg.rotation.x = -this.currentPose.hipLX;
+    this.rig.rightUpLeg.rotation.x = -this.currentPose.hipRX;
+    this.rig.leftLeg.rotation.x = -this.currentPose.kneeLX;
+    this.rig.rightLeg.rotation.x = -this.currentPose.kneeRX;
   }
 
   // --- Board visual feedback ---
@@ -512,10 +662,11 @@ export class Player {
     this.position.set(0, 0, 0);
     this.velocity.set(0, 0, 0);
     this.speed = 10;
-    this.steerAngle = 0;
+    this.boardAngle = 0;
     this.airborne = false;
     this.health = 3;
     this.invulnerable = false;
+    this.outOfBoundsTimer = 0;
     this.isPumping = false;
     this.absorbedLanding = false;
     this.lastSlope = 0;
@@ -526,6 +677,10 @@ export class Player {
     this.trickScore = 0;
     this.pendingTrickName = null;
     this.trickFlashTimer = 0;
+    this.boardLean = 0;
+    this.carveIntensity = 0;
+    this.carveSign = 0;
+    this.snowContact = 0;
     this.mesh.visible = true;
     this.mesh.scale.set(1, 1, 1);
     this.mesh.position.set(0, 0, 0);
@@ -543,15 +698,18 @@ export class Player {
     this.currentPose = { ...POSE_STANDING };
     if (this.rig) {
       this.rig.hips.position.y = POSE_STANDING.hipsY;
-      this.rig.spine.rotation.x = POSE_STANDING.spineX;
-      this.rig.leftArm.rotation.z = POSE_STANDING.armLZ;
-      this.rig.rightArm.rotation.z = POSE_STANDING.armRZ;
+      this.rig.spine.rotation.x = 0;
+      this.rig.spine.rotation.z = -POSE_STANDING.spineX;
+      this.rig.leftArm.rotation.x = POSE_STANDING.armLX;
+      this.rig.rightArm.rotation.x = POSE_STANDING.armRX;
       this.rig.leftForeArm.rotation.x = POSE_STANDING.elbowLX;
       this.rig.rightForeArm.rotation.x = POSE_STANDING.elbowRX;
-      this.rig.leftUpLeg.rotation.x = POSE_STANDING.hipLX;
-      this.rig.rightUpLeg.rotation.x = POSE_STANDING.hipRX;
-      this.rig.leftLeg.rotation.x = POSE_STANDING.kneeLX;
-      this.rig.rightLeg.rotation.x = POSE_STANDING.kneeRX;
+      this.rig.leftUpLeg.rotation.x = -POSE_STANDING.hipLX;
+      this.rig.rightUpLeg.rotation.x = -POSE_STANDING.hipRX;
+      this.rig.leftLeg.rotation.x = -POSE_STANDING.kneeLX;
+      this.rig.rightLeg.rotation.x = -POSE_STANDING.kneeRX;
+      this.rig.leftArm.rotation.z = 0;
+      this.rig.rightArm.rotation.z = 0;
     }
   }
 }
