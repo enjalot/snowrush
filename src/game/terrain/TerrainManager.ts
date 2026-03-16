@@ -33,7 +33,7 @@ export class TerrainManager {
     // Use a while loop so multiple chunks can recycle in a single frame at high speed.
     while (this.chunks.length > 0) {
       const recycleThreshold = this.chunks[0].zStart;
-      if (playerZ < recycleThreshold - CHUNK_DEPTH * 2) {
+      if (playerZ < recycleThreshold - CHUNK_DEPTH * 4) {
         this.recycleOldest();
       } else {
         break;
@@ -78,6 +78,20 @@ export class TerrainManager {
         obstacles.push(...chunk.obstacles);
       }
     }
+    return obstacles;
+  }
+
+  getActiveObstaclesInRange(zA: number, zB: number): ObstacleData[] {
+    const rangeMin = Math.min(zA, zB) - CHUNK_DEPTH;
+    const rangeMax = Math.max(zA, zB) + CHUNK_DEPTH;
+    const obstacles: ObstacleData[] = [];
+
+    for (const chunk of this.chunks) {
+      if (chunk.zEnd <= rangeMax && chunk.zStart >= rangeMin) {
+        obstacles.push(...chunk.obstacles);
+      }
+    }
+
     return obstacles;
   }
 

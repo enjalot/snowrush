@@ -1,5 +1,9 @@
+import { useState } from 'react';
 import type { PhysicsSettingKey, PhysicsSettings } from '../game/physicsSettings';
 import { PHYSICS_SETTING_CONTROLS } from '../game/physicsSettings';
+import type { NpcSettingKey, NpcSettings } from '../game/npcSettings';
+import { NPC_SETTING_CONTROLS } from '../game/npcSettings';
+import { NPC_APPEARANCES } from '../game/npcPalette';
 import type { LeaderboardEntry } from './leaderboard';
 
 interface PauseMenuProps {
@@ -8,8 +12,11 @@ interface PauseMenuProps {
   leaderboard: LeaderboardEntry[];
   isTouchDevice: boolean;
   physicsSettings: PhysicsSettings;
+  npcSettings: NpcSettings;
   onPhysicsSettingChange: (key: PhysicsSettingKey, value: number) => void;
   onPhysicsSettingsReset: () => void;
+  onNpcSettingChange: (key: NpcSettingKey, value: number) => void;
+  onNpcSettingsReset: () => void;
   onResume: () => void;
   onRestart: () => void;
 }
@@ -35,11 +42,16 @@ export function PauseMenu({
   leaderboard,
   isTouchDevice,
   physicsSettings,
+  npcSettings,
   onPhysicsSettingChange,
   onPhysicsSettingsReset,
+  onNpcSettingChange,
+  onNpcSettingsReset,
   onResume,
   onRestart,
 }: PauseMenuProps) {
+  const [activeSettingsTab, setActiveSettingsTab] = useState<'physics' | 'npc'>('physics');
+
   return (
     <div
       style={{
@@ -85,7 +97,7 @@ export function PauseMenu({
             </div>
 
             <div style={{ marginTop: '14px', fontSize: '14px', color: 'rgba(255,255,255,0.65)' }}>
-              This run is only saved to the leaderboard after a wipeout.
+              This run is only saved to the leaderboard after the race ends.
             </div>
 
             <div style={{ marginTop: '32px', display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
@@ -128,6 +140,39 @@ export function PauseMenu({
 
           <div style={{ display: 'grid', gap: '20px' }}>
             <div style={{ ...cardStyle, padding: '18px 20px' }}>
+              <div style={{ display: 'flex', gap: '10px', marginBottom: '18px', flexWrap: 'wrap' }}>
+                <button
+                  onClick={() => setActiveSettingsTab('physics')}
+                  style={{
+                    padding: '10px 14px',
+                    fontSize: '13px',
+                    fontWeight: 700,
+                    color: '#fff',
+                    background: activeSettingsTab === 'physics' ? 'rgba(125,211,252,0.22)' : 'rgba(255,255,255,0.08)',
+                    border: '1px solid rgba(255,255,255,0.18)',
+                    borderRadius: '999px',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Ride Tuning
+                </button>
+                <button
+                  onClick={() => setActiveSettingsTab('npc')}
+                  style={{
+                    padding: '10px 14px',
+                    fontSize: '13px',
+                    fontWeight: 700,
+                    color: '#fff',
+                    background: activeSettingsTab === 'npc' ? 'rgba(125,211,252,0.22)' : 'rgba(255,255,255,0.08)',
+                    border: '1px solid rgba(255,255,255,0.18)',
+                    borderRadius: '999px',
+                    cursor: 'pointer',
+                  }}
+                >
+                  NPC Rivals
+                </button>
+              </div>
+
               <div
                 style={{
                   display: 'flex',
@@ -145,15 +190,17 @@ export function PauseMenu({
                       color: 'rgba(255,255,255,0.75)',
                     }}
                   >
-                    Ride Tuning
+                    {activeSettingsTab === 'physics' ? 'Ride Tuning' : 'NPC Rivals'}
                   </div>
                   <div style={{ marginTop: '6px', fontSize: '13px', color: 'rgba(255,255,255,0.6)' }}>
-                    Whole-number sliders, saved locally, and applied immediately.
+                    {activeSettingsTab === 'physics'
+                      ? 'Whole-number sliders, saved locally, and applied immediately.'
+                      : 'Tune the rival pack live. Their strategy already considers obstacles, crowding, and future threat inputs.'}
                   </div>
                 </div>
 
                 <button
-                  onClick={onPhysicsSettingsReset}
+                  onClick={activeSettingsTab === 'physics' ? onPhysicsSettingsReset : onNpcSettingsReset}
                   style={{
                     padding: '10px 14px',
                     fontSize: '13px',
@@ -169,37 +216,110 @@ export function PauseMenu({
                 </button>
               </div>
 
-              <div style={{ marginTop: '18px', display: 'grid', gap: '14px' }}>
-                {PHYSICS_SETTING_CONTROLS.map((control) => {
-                  const value = physicsSettings[control.key];
-                  const valueLabel = control.unit ? `${value}${control.unit}` : `${value}`;
+              {activeSettingsTab === 'physics' ? (
+                <div style={{ marginTop: '18px', display: 'grid', gap: '14px' }}>
+                  {PHYSICS_SETTING_CONTROLS.map((control) => {
+                    const value = physicsSettings[control.key];
+                    const valueLabel = control.unit ? `${value}${control.unit}` : `${value}`;
 
-                  return (
-                    <label key={control.key} style={{ display: 'grid', gap: '8px' }}>
-                      <div
-                        style={{
-                          display: 'flex',
-                          alignItems: 'baseline',
-                          justifyContent: 'space-between',
-                          gap: '12px',
-                        }}
-                      >
-                        <span style={{ fontWeight: 700 }}>{control.label}</span>
-                        <span style={{ color: '#7dd3fc', fontVariantNumeric: 'tabular-nums' }}>{valueLabel}</span>
-                      </div>
-                      <input
-                        type="range"
-                        min={control.min}
-                        max={control.max}
-                        step={1}
-                        value={value}
-                        onChange={(event) => onPhysicsSettingChange(control.key, Number(event.target.value))}
-                      />
-                      <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.58)' }}>{control.hint}</span>
-                    </label>
-                  );
-                })}
-              </div>
+                    return (
+                      <label key={control.key} style={{ display: 'grid', gap: '8px' }}>
+                        <div
+                          style={{
+                            display: 'flex',
+                            alignItems: 'baseline',
+                            justifyContent: 'space-between',
+                            gap: '12px',
+                          }}
+                        >
+                          <span style={{ fontWeight: 700 }}>{control.label}</span>
+                          <span style={{ color: '#7dd3fc', fontVariantNumeric: 'tabular-nums' }}>{valueLabel}</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={control.min}
+                          max={control.max}
+                          step={1}
+                          value={value}
+                          onChange={(event) => onPhysicsSettingChange(control.key, Number(event.target.value))}
+                        />
+                        <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.58)' }}>{control.hint}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div style={{ marginTop: '18px', display: 'grid', gap: '14px' }}>
+                  {NPC_SETTING_CONTROLS.map((control) => {
+                    const value = npcSettings[control.key];
+
+                    return (
+                      <label key={control.key} style={{ display: 'grid', gap: '8px' }}>
+                        <div
+                          style={{
+                            display: 'flex',
+                            alignItems: 'baseline',
+                            justifyContent: 'space-between',
+                            gap: '12px',
+                          }}
+                        >
+                          <span style={{ fontWeight: 700 }}>{control.label}</span>
+                          <span style={{ color: '#7dd3fc', fontVariantNumeric: 'tabular-nums' }}>{value}</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={control.min}
+                          max={control.max}
+                          step={1}
+                          value={value}
+                          onChange={(event) => onNpcSettingChange(control.key, Number(event.target.value))}
+                        />
+                        <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.58)' }}>{control.hint}</span>
+                      </label>
+                    );
+                  })}
+
+                  <div
+                    style={{
+                      marginTop: '2px',
+                      padding: '14px',
+                      borderRadius: '14px',
+                      background: 'rgba(255,255,255,0.04)',
+                      border: '1px solid rgba(255,255,255,0.08)',
+                    }}
+                  >
+                    <div style={{ fontSize: '12px', letterSpacing: '0.08em', textTransform: 'uppercase', color: 'rgba(255,255,255,0.7)' }}>
+                      Rival Palette
+                    </div>
+                    <div style={{ marginTop: '12px', display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                      {NPC_APPEARANCES.slice(0, Math.max(2, npcSettings.count)).map((appearance, index) => (
+                        <div
+                          key={`${appearance.labelColor}-${index}`}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '10px',
+                            padding: '8px 10px',
+                            borderRadius: '999px',
+                            background: 'rgba(255,255,255,0.05)',
+                          }}
+                        >
+                          <span
+                            style={{
+                              width: '12px',
+                              height: '12px',
+                              borderRadius: '999px',
+                              background: appearance.labelColor,
+                              boxShadow: `0 0 0 3px rgba(255,255,255,0.08), 0 0 14px ${appearance.labelColor}`,
+                            }}
+                          />
+                          <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.8)' }}>Rival {index + 1}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div>

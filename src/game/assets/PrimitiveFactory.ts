@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { CharacterRig } from '../types';
+import type { CharacterRig, SnowboarderAppearance } from '../types';
 
 // Stick-figure limb dimensions
 const LIMB_RADIUS = 0.04;
@@ -98,13 +98,41 @@ function createFoot(
   return foot;
 }
 
+function createCheckerTexture(size: number, cells: number): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    throw new Error('Unable to create 2D context for finish line texture.');
+  }
+
+  const cellSize = size / cells;
+  for (let row = 0; row < cells; row++) {
+    for (let col = 0; col < cells; col++) {
+      ctx.fillStyle = (row + col) % 2 === 0 ? '#ffffff' : '#111111';
+      ctx.fillRect(col * cellSize, row * cellSize, cellSize, cellSize);
+    }
+  }
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  return texture;
+}
+
 export class PrimitiveFactory {
-  static createSnowboarder(): THREE.Group {
+  static createSnowboarder(appearance?: Partial<SnowboarderAppearance>): THREE.Group {
     const group = new THREE.Group();
+    const jacketColor = appearance?.jacketColor ?? 0x2244aa;
+    const accentColor = appearance?.accentColor ?? 0x3355cc;
+    const boardColor = appearance?.boardColor ?? 0xcc3333;
 
     // Shared materials
-    const clothMat = new THREE.MeshStandardMaterial({ color: 0x2244aa });
-    const jointMat = new THREE.MeshStandardMaterial({ color: 0x3355cc });
+    const clothMat = new THREE.MeshStandardMaterial({ color: jacketColor });
+    const jointMat = new THREE.MeshStandardMaterial({ color: accentColor });
     const skinMat = new THREE.MeshStandardMaterial({ color: 0xffccaa });
     const bootMat = new THREE.MeshStandardMaterial({ color: 0x2d2d38 });
 
@@ -161,7 +189,7 @@ export class PrimitiveFactory {
 
     // ── Snowboard (direct child of root, NOT skeleton) ──
     const boardGeo = createBoardGeometry(0.4, 0.04, 1.4, 0.1);
-    const boardMat = new THREE.MeshStandardMaterial({ color: 0xcc3333 });
+    const boardMat = new THREE.MeshStandardMaterial({ color: boardColor });
     const board = new THREE.Mesh(boardGeo, boardMat);
     board.name = 'board';
     board.position.y = 0.03;
@@ -280,6 +308,143 @@ export class PrimitiveFactory {
 
     group.userData.boundingSize = new THREE.Vector3(halfW, height / 2, halfD);
     group.userData.isRamp = true;
+    return group;
+  }
+
+  static createRail(config: {
+    length?: number;
+    startTopY?: number;
+    endTopY?: number;
+    supportGroundYs?: number[];
+  } = {}): THREE.Group {
+    const group = new THREE.Group();
+    const length = config.length ?? 12;
+    const railHeight = 0.82;
+    const postRadius = 0.07;
+    const topRadius = 0.09;
+    const halfLength = length / 2;
+    const railMaterial = new THREE.MeshStandardMaterial({
+      color: 0xc8d4e3,
+      metalness: 0.78,
+      roughness: 0.28,
+    });
+    const supportMaterial = new THREE.MeshStandardMaterial({
+      color: 0x5a6675,
+      metalness: 0.42,
+      roughness: 0.6,
+    });
+    const startTopY = config.startTopY ?? railHeight;
+    const endTopY = config.endTopY ?? railHeight;
+    const supportCount = Math.max(2, config.supportGroundYs?.length ?? Math.round(length / 4));
+    const supportGroundYs = config.supportGroundYs && config.supportGroundYs.length > 0
+      ? config.supportGroundYs
+      : Array.from({ length: supportCount }, () => 0);
+
+    const startPoint = new THREE.Vector3(0, startTopY, halfLength);
+    const endPoint = new THREE.Vector3(0, endTopY, -halfLength);
+    const topDirection = endPoint.clone().sub(startPoint);
+    const topBarLength = topDirection.length();
+    const topBar = new THREE.Mesh(
+      new THREE.CylinderGeometry(topRadius, topRadius, topBarLength, 12),
+      railMaterial,
+    );
+    topBar.position.copy(startPoint).lerp(endPoint, 0.5);
+    topBar.quaternion.setFromUnitVectors(
+      new THREE.Vector3(0, 1, 0),
+      topDirection.clone().normalize(),
+    );
+    topBar.castShadow = true;
+    group.add(topBar);
+
+    for (let index = 0; index < supportGroundYs.length; index++) {
+      const t = supportGroundYs.length === 1 ? 0.5 : index / (supportGroundYs.length - 1);
+      const postZ = THREE.MathUtils.lerp(halfLength - 0.6, -halfLength + 0.6, t);
+      const localTopY = THREE.MathUtils.lerp(startTopY, endTopY, t);
+      const localGroundY = supportGroundYs[index];
+      const postHeight = Math.max(0.12, localTopY - localGroundY);
+      const post = new THREE.Mesh(
+        new THREE.CylinderGeometry(postRadius, postRadius * 1.12, postHeight, 8),
+        supportMaterial,
+      );
+      post.position.set(0, localGroundY + postHeight / 2, postZ);
+      post.castShadow = true;
+      group.add(post);
+
+      const foot = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.16, 0.2, 0.08, 10),
+        supportMaterial,
+      );
+      foot.position.set(0, localGroundY + 0.04, postZ);
+      foot.receiveShadow = true;
+      group.add(foot);
+    }
+
+    const minGroundY = supportGroundYs.length > 0 ? Math.min(...supportGroundYs) : 0;
+    const maxTopY = Math.max(startTopY, endTopY);
+    group.userData.boundingSize = new THREE.Vector3(
+      0.7,
+      Math.max(Math.abs(maxTopY), Math.abs(minGroundY - 0.08)),
+      halfLength,
+    );
+    group.userData.railHeight = railHeight;
+    group.userData.railLength = length;
+    return group;
+  }
+
+  static createFinishLine(): THREE.Group {
+    const group = new THREE.Group();
+    const poleMaterial = new THREE.MeshStandardMaterial({ color: 0x4b5563, roughness: 0.7 });
+    const trimMaterial = new THREE.MeshStandardMaterial({ color: 0xf5f5f5, roughness: 0.5 });
+    const checkerTexture = createCheckerTexture(256, 8);
+    const checkerMaterial = new THREE.MeshStandardMaterial({
+      map: checkerTexture,
+      side: THREE.DoubleSide,
+      roughness: 0.45,
+    });
+
+    const poleGeometry = new THREE.CylinderGeometry(0.16, 0.18, 7, 10);
+    const leftPole = new THREE.Mesh(poleGeometry, poleMaterial);
+    leftPole.position.set(-6, 3.5, 0);
+    leftPole.castShadow = true;
+    group.add(leftPole);
+
+    const rightPole = leftPole.clone();
+    rightPole.position.x = 6;
+    group.add(rightPole);
+
+    const beam = new THREE.Mesh(new THREE.BoxGeometry(12.8, 0.28, 0.28), trimMaterial);
+    beam.position.set(0, 6.9, 0);
+    beam.castShadow = true;
+    group.add(beam);
+
+    const banner = new THREE.Mesh(new THREE.PlaneGeometry(11, 1.7), checkerMaterial);
+    banner.position.set(0, 6.1, 0);
+    group.add(banner);
+
+    const sideFlagGeometry = new THREE.PlaneGeometry(1.6, 1.2, 8, 4);
+    const leftFlag = new THREE.Mesh(sideFlagGeometry, checkerMaterial);
+    leftFlag.position.set(-5.15, 5.65, 0.15);
+    leftFlag.rotation.y = Math.PI / 7;
+    leftFlag.rotation.z = 0.08;
+    group.add(leftFlag);
+
+    const rightFlag = leftFlag.clone();
+    rightFlag.position.set(5.15, 5.65, -0.15);
+    rightFlag.rotation.y = -Math.PI / 7;
+    rightFlag.rotation.z = -0.08;
+    group.add(rightFlag);
+
+    const baseGeometry = new THREE.CylinderGeometry(0.55, 0.7, 0.35, 12);
+    const leftBase = new THREE.Mesh(baseGeometry, trimMaterial);
+    leftBase.position.set(-6, 0.18, 0);
+    leftBase.receiveShadow = true;
+    group.add(leftBase);
+
+    const rightBase = leftBase.clone();
+    rightBase.position.x = 6;
+    group.add(rightBase);
+
+    group.userData.checkerTexture = checkerTexture;
     return group;
   }
 }

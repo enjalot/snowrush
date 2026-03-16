@@ -86,8 +86,8 @@ export function MainMenu({ onStart, isTouchDevice }: MainMenuProps) {
             }}
           >
             {isTouchDevice
-              ? 'Touch: hold to pump, release to pop, drag left and right to steer, pull up for speed and frontflips, pull down for braking and backflips.'
-              : 'Keyboard: A and D steer, W and S control front and back flips, and hold then release Space to pump and pop.'}
+              ? 'Touch: hold to pump, release to pop, drag left and right to steer, pull up for speed and frontflips, pull down for braking and backflips. On rails, drag up or down to manual and steer to spin.'
+              : 'Keyboard: A and D steer, W and S control front and back flips, and hold then release Space to pump and pop. On rails, A and D spin while W and S hold manuals.'}
           </div>
           {!isTouchDevice && (
             <div

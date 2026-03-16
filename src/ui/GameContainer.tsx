@@ -11,6 +11,12 @@ import {
   getStoredPhysicsSettings,
   savePhysicsSettings,
 } from '../game/physicsSettings';
+import type { NpcSettingKey, NpcSettings } from '../game/npcSettings';
+import {
+  DEFAULT_NPC_SETTINGS,
+  getStoredNpcSettings,
+  saveNpcSettings,
+} from '../game/npcSettings';
 import {
   getDefaultLeaderboardName,
   generateLeaderboardName,
@@ -41,17 +47,21 @@ export function GameContainer() {
     score: 0,
     trickName: null,
     health: 3,
+    finishDistance: 1000,
+    raceOutcome: null,
+    racePlacements: [],
   });
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>(() => getLeaderboard());
   const [draftName, setDraftName] = useState(() => getDefaultLeaderboardName());
   const [savedEntryId, setSavedEntryId] = useState<string | null>(null);
   const [physicsSettings, setPhysicsSettings] = useState<PhysicsSettings>(() => getStoredPhysicsSettings());
+  const [npcSettings, setNpcSettings] = useState<NpcSettings>(() => getStoredNpcSettings());
   const [{ isTouchDevice, isCompactLayout }, setViewportFlags] = useState(() => getViewportFlags());
 
   useEffect(() => {
     if (!canvasRef.current) return;
 
-    const game = new Game(canvasRef.current, physicsSettings);
+    const game = new Game(canvasRef.current, physicsSettings, npcSettings);
     gameRef.current = game;
 
     game.setUIStateCallback((state) => {
@@ -126,6 +136,25 @@ export function GameContainer() {
     gameRef.current?.setPhysicsSettings(next);
   }, []);
 
+  const handleNpcSettingChange = useCallback((key: NpcSettingKey, value: number) => {
+    setNpcSettings((current) => {
+      const next = {
+        ...current,
+        [key]: value,
+      };
+      saveNpcSettings(next);
+      gameRef.current?.setNpcSettings(next);
+      return next;
+    });
+  }, []);
+
+  const handleNpcSettingsReset = useCallback(() => {
+    const next = { ...DEFAULT_NPC_SETTINGS };
+    setNpcSettings(next);
+    saveNpcSettings(next);
+    gameRef.current?.setNpcSettings(next);
+  }, []);
+
   const handleNameChange = useCallback((value: string) => {
     setDraftName(value);
   }, []);
@@ -183,8 +212,11 @@ export function GameContainer() {
           leaderboard={leaderboard}
           isTouchDevice={isTouchDevice}
           physicsSettings={physicsSettings}
+          npcSettings={npcSettings}
           onPhysicsSettingChange={handlePhysicsSettingChange}
           onPhysicsSettingsReset={handlePhysicsSettingsReset}
+          onNpcSettingChange={handleNpcSettingChange}
+          onNpcSettingsReset={handleNpcSettingsReset}
           onResume={handleResume}
           onRestart={handleRestart}
         />
@@ -193,6 +225,9 @@ export function GameContainer() {
         <GameOverScreen
           score={uiState.score}
           distance={uiState.distance}
+          finishDistance={uiState.finishDistance}
+          raceOutcome={uiState.raceOutcome}
+          racePlacements={uiState.racePlacements}
           leaderboard={leaderboard}
           draftName={draftName}
           savedEntryId={savedEntryId}

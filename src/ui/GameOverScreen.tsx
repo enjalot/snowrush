@@ -1,9 +1,13 @@
 import type { FormEvent } from 'react';
 import type { LeaderboardEntry } from './leaderboard';
+import type { RaceOutcome, RacePlacement } from '../game/types';
 
 interface GameOverScreenProps {
   score: number;
   distance: number;
+  finishDistance: number;
+  raceOutcome: RaceOutcome;
+  racePlacements: RacePlacement[];
   leaderboard: LeaderboardEntry[];
   draftName: string;
   savedEntryId: string | null;
@@ -38,6 +42,9 @@ const secondaryButtonStyle = {
 export function GameOverScreen({
   score,
   distance,
+  finishDistance,
+  raceOutcome,
+  racePlacements,
   leaderboard,
   draftName,
   savedEntryId,
@@ -50,6 +57,9 @@ export function GameOverScreen({
     event.preventDefault();
     onSubmitScore();
   };
+
+  const playerPlacement = racePlacements.find((placement) => placement.isPlayer) ?? null;
+  const title = raceOutcome === 'finished' ? 'FINISH!' : 'WIPEOUT!';
 
   return (
     <div
@@ -87,11 +97,14 @@ export function GameOverScreen({
                 textShadow: '0 4px 8px rgba(0,0,0,0.5)',
               }}
             >
-              WIPEOUT!
+              {title}
             </h2>
             <div style={{ marginTop: '24px', fontSize: '20px' }}>
-              <div>Distance: <strong>{Math.floor(distance)}m</strong></div>
+              <div>Distance: <strong>{Math.floor(distance)}m / {finishDistance}m</strong></div>
               <div style={{ marginTop: '8px' }}>Score: <strong>{score}</strong></div>
+              <div style={{ marginTop: '8px' }}>
+                Placement: <strong>{playerPlacement ? `${playerPlacement.place}${playerPlacement.place === 1 ? 'st' : playerPlacement.place === 2 ? 'nd' : playerPlacement.place === 3 ? 'rd' : 'th'}` : '-'}</strong>
+              </div>
             </div>
 
             <form onSubmit={handleSubmit} style={{ marginTop: '28px' }}>
@@ -176,6 +189,51 @@ export function GameOverScreen({
           </div>
 
           <div>
+            <div
+              style={{
+                fontSize: '14px',
+                letterSpacing: '0.08em',
+                textTransform: 'uppercase',
+                color: 'rgba(255,255,255,0.75)',
+              }}
+            >
+              Race Results
+            </div>
+            <div
+              style={{
+                marginTop: '14px',
+                marginBottom: '20px',
+                background: 'rgba(7, 12, 24, 0.55)',
+                border: '1px solid rgba(255,255,255,0.08)',
+                borderRadius: '18px',
+                overflow: 'hidden',
+              }}
+            >
+              {racePlacements.map((placement, index) => (
+                <div
+                  key={placement.id}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: '48px 1fr auto',
+                    gap: '12px',
+                    alignItems: 'center',
+                    padding: '14px 18px',
+                    background: placement.isPlayer ? 'rgba(125, 211, 252, 0.14)' : 'transparent',
+                    borderTop: index === 0 ? 'none' : '1px solid rgba(255,255,255,0.06)',
+                  }}
+                >
+                  <div style={{ fontWeight: 700, color: '#7dd3fc' }}>#{placement.place}</div>
+                  <div>
+                    <div style={{ fontWeight: 700 }}>{placement.name}</div>
+                    <div style={{ marginTop: '4px', fontSize: '13px', color: 'rgba(255,255,255,0.65)' }}>
+                      {placement.finished ? `Finished ${finishDistance}m` : `${Math.floor(placement.distance)}m`} {placement.eliminated ? '· KO' : ''}
+                    </div>
+                  </div>
+                  <div style={{ fontWeight: 700 }}>{placement.score}</div>
+                </div>
+              ))}
+            </div>
+
             <div
               style={{
                 fontSize: '14px',

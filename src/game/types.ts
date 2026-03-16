@@ -9,8 +9,31 @@ export interface InputState {
 }
 
 export type GameStateType = 'MENU' | 'PLAYING' | 'PAUSED' | 'GAME_OVER';
+export type RaceOutcome = 'finished' | 'wipeout' | null;
 
 export type TrickType = 'spin-left' | 'spin-right' | 'frontflip' | 'backflip' | null;
+export type ObstacleType = 'tree' | 'rock' | 'ramp' | 'rail';
+
+export interface RailData {
+  centerX: number;
+  startZ: number;
+  endZ: number;
+  height: number;
+  length: number;
+  startTopY: number;
+  endTopY: number;
+}
+
+export interface RacePlacement {
+  id: string;
+  name: string;
+  place: number;
+  score: number;
+  distance: number;
+  isPlayer: boolean;
+  finished: boolean;
+  eliminated: boolean;
+}
 
 export interface GameUIState {
   gameState: GameStateType;
@@ -19,12 +42,23 @@ export interface GameUIState {
   score: number;
   trickName: string | null;
   health: number;
+  finishDistance: number;
+  raceOutcome: RaceOutcome;
+  racePlacements: RacePlacement[];
 }
 
 export interface ObstacleData {
   mesh: THREE.Object3D;
-  type: 'tree' | 'rock' | 'ramp';
+  type: ObstacleType;
   boundingSize: THREE.Vector3;
+  rail?: RailData;
+}
+
+export interface SnowboarderAppearance {
+  jacketColor: number;
+  accentColor: number;
+  boardColor: number;
+  labelColor: string;
 }
 
 /** Joint hierarchy for character animation — names follow Mixamo convention */

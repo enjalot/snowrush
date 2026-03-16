@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { InputState, TrickType, CharacterRig } from '../types';
+import type { InputState, TrickType, CharacterRig, ObstacleData } from '../types';
 import type { TerrainManager } from '../terrain/TerrainManager';
 import type { ResolvedPhysicsSettings } from '../physicsSettings';
 import { clamp, lerp, remap } from '../utils/math';
@@ -17,6 +17,19 @@ const MIN_SPEED = 5;
 const PUMP_SPEED_BOOST = 3;
 const PUMP_ABSORB_SPEED_BOOST = 2;
 const PUMP_SLOPE_BONUS = 6;
+const RAIL_DRAG_FACTOR = 0.3;
+const RAIL_SLOPE_FACTOR = 0.6;
+const RAIL_ATTACH_COOLDOWN = 0.22;
+const RAIL_SPIN_INPUT_THRESHOLD = 0.85;
+const RAIL_MANUAL_INPUT_THRESHOLD = 0.85;
+const RAIL_MANUAL_TILT = Math.PI / 7;
+const RAIL_SCORE_GRIND_PER_METER = 10;
+const RAIL_SCORE_MANUAL_PER_METER = 22;
+const RAIL_SCORE_SPIN_PER_METER = 16;
+const RAIL_SPIN_HALF_ROTATION_BONUS = 55;
+const RAIL_ENTRY_SPIN_MULTIPLIER_STEP = 0.2;
+const RAIL_ENTRY_FLIP_MULTIPLIER_STEP = 0.35;
+const RAIL_ENTRY_MULTIPLIER_CAP = 3;
 
 // Trick constants
 const SPIN_SPEED = Math.PI * 2.5;  // radians/sec — full spin in ~0.4s
@@ -53,6 +66,21 @@ interface PoseTargets {
   kneeLX: number; kneeRX: number;
 }
 
+interface RailRideState {
+  obstacle: ObstacleData;
+  startZ: number;
+  endZ: number;
+  centerX: number;
+  startTopY: number;
+  endTopY: number;
+  distance: number;
+  manualDistance: number;
+  spinDistance: number;
+  spinAngleStart: number;
+  entryMultiplier: number;
+  entryLabel: string | null;
+}
+
 const POSE_STANDING: PoseTargets = {
   hipsY: 0.65,
   spineX: 0.08,
@@ -84,6 +112,7 @@ const POSE_LERP_SPEED = 8;
 const OUT_OF_BOUNDS_FALL_TIME = 5;
 const SNOW_CONTACT_FULL = 0.06;
 const SNOW_CONTACT_CUTOFF = 0.32;
+const INPUT_NEUTRAL_THRESHOLD = 0.15;
 
 function wrapAngle(angle: number): number {
   return Math.atan2(Math.sin(angle), Math.cos(angle));
@@ -110,16 +139,23 @@ export class Player {
   currentTrick: TrickType = null;
   trickScore = 0;
   pendingTrickName: string | null = null;
+  private currentSpinTrick: Extract<TrickType, 'spin-left' | 'spin-right'> | null = null;
+  private currentFlipTrick: Extract<TrickType, 'frontflip' | 'backflip'> | null = null;
   private spinAngle = 0;
   private flipAngle = 0;
   private trickFlashTimer = 0;
   private trickStartSteerAngle = 0;
+  private trickInputLockSteer = false;
+  private trickInputLockAccelerate = false;
 
   // Pump state
   private isPumping = false;
   private absorbedLanding = false;
   private lastSlope = 0;
   private pumpSlopeAccum = 0;
+  private railRide: RailRideState | null = null;
+  private railAttachCooldown = 0;
+  private manualTilt = 0;
 
   private invulnerableTimer = 0;
   private invulnerableDuration = 1.5;
@@ -134,6 +170,7 @@ export class Player {
   private boardMat: THREE.MeshStandardMaterial | null = null;
   private flashColor = new THREE.Color(0, 0, 0);
   private flashIntensity = 0;
+  private runStartZ = 0;
 
   // Character rig & pose animation
   private rig: CharacterRig | null = null;
@@ -190,6 +227,18 @@ export class Player {
     return !this.airborne;
   }
 
+  get grinding(): boolean {
+    return this.railRide !== null;
+  }
+
+  get distanceTraveled(): number {
+    return Math.abs(this.position.z - this.runStartZ);
+  }
+
+  get score(): number {
+    return Math.floor(this.distanceTraveled) + this.trickScore;
+  }
+
   get outOfBounds(): boolean {
     return this.outOfBoundsTimer > 0;
   }
@@ -232,9 +281,16 @@ export class Player {
   }
 
   update(dt: number, input: InputState, terrainManager: TerrainManager) {
+    this.railAttachCooldown = Math.max(0, this.railAttachCooldown - dt);
+
     if (this.outOfBounds) {
       this.snowContact = 0;
       this.updateOutOfBoundsFall(dt);
+      return;
+    }
+
+    if (this.railRide) {
+      this.updateRailRide(dt, input, terrainManager);
       return;
     }
 
@@ -344,41 +400,9 @@ export class Player {
     const snowContactT = 1 - Math.exp(-18 * dt);
     this.snowContact = lerp(this.snowContact, snowContactTarget, snowContactT);
 
-    // --- Invulnerability ---
-    if (this.invulnerable) {
-      this.invulnerableTimer -= dt;
-      this.blinkTimer += dt;
-      this.mesh.visible = Math.sin(this.blinkTimer * 15) > 0;
-      if (this.invulnerableTimer <= 0) {
-        this.invulnerable = false;
-        this.mesh.visible = true;
-      }
-    }
-
-    // --- Trick flash timer ---
-    if (this.trickFlashTimer > 0) {
-      this.trickFlashTimer -= dt;
-      if (this.trickFlashTimer <= 0) {
-        this.pendingTrickName = null;
-      }
-    }
-
-    // --- Sync mesh ---
-    this.mesh.position.copy(this.position);
-
-    if (this.airborne && this.currentTrick) {
-      // Show trick rotation on the mesh
-      this.mesh.rotation.set(this.flipAngle, this.spinAngle, 0);
-    } else {
-      this.mesh.rotation.y = -this.boardAngle;
-      this.mesh.rotation.x = 0;
-      this.mesh.rotation.z = this.boardLean;
-    }
-
-    // Animate limb poses (crouch, airborne, standing)
+    this.updateTransientEffects(dt);
+    this.syncMeshTransform();
     this.updatePose(dt);
-
-    // Board visual feedback
     this.updateBoardFeedback(dt);
   }
 
@@ -408,72 +432,320 @@ export class Player {
     }
   }
 
-  // --- Trick system ---
-
-  private updateTricks(dt: number, input: InputState) {
-    // Spins: A/D while airborne (steer keys)
-    if (input.steer !== 0 && !this.currentTrick) {
-      this.currentTrick = input.steer < 0 ? 'spin-left' : 'spin-right';
-      this.trickStartSteerAngle = -this.boardAngle;
-      this.spinAngle = -this.boardAngle;
-      this.flipAngle = 0;
+  private updateRailRide(dt: number, input: InputState, terrainManager: TerrainManager) {
+    const railRide = this.railRide;
+    if (!railRide) {
+      return;
     }
 
-    // Flips: W/S while airborne (no spacebar needed)
-    if (input.accelerate !== 0 && !this.currentTrick) {
-      this.currentTrick = input.accelerate > 0 ? 'frontflip' : 'backflip';
-      this.flipAngle = 0;
-      this.spinAngle = -this.boardAngle;
-      this.trickStartSteerAngle = -this.boardAngle;
+    this.airborne = false;
+    this.isPumping = false;
+    this.absorbedLanding = false;
+    this.pumpSlopeAccum = 0;
+    this.carveIntensity = 0;
+    this.carveSign = 0;
+    this.velocity.set(0, 0, -this.speed);
+
+    this.speed += this.slopeAccel * RAIL_SLOPE_FACTOR * dt;
+    this.speed -= this.speed * this.physics.drag * RAIL_DRAG_FACTOR * dt;
+    this.speed = clamp(this.speed, this.minSpeed, this.maxSpeed);
+
+    const previousZ = this.position.z;
+    this.position.x = railRide.centerX;
+    this.position.z = Math.max(railRide.endZ, this.position.z - this.speed * dt);
+    const traveled = Math.max(0, previousZ - this.position.z);
+    railRide.distance += traveled;
+    this.position.y = this.sampleRailTopY(this.position.z, railRide);
+
+    const spinInput = Math.abs(input.steer) >= RAIL_SPIN_INPUT_THRESHOLD ? Math.sign(input.steer) : 0;
+    const manualInput = Math.abs(input.accelerate) >= RAIL_MANUAL_INPUT_THRESHOLD ? Math.sign(input.accelerate) : 0;
+    const manualTarget = manualInput * RAIL_MANUAL_TILT;
+    const tiltT = 1 - Math.exp(-10 * dt);
+
+    if (spinInput < 0) {
+      this.spinAngle += SPIN_SPEED * dt;
+      railRide.spinDistance += traveled;
+    } else if (spinInput > 0) {
+      this.spinAngle -= SPIN_SPEED * dt;
+      railRide.spinDistance += traveled;
     }
 
-    // Animate the trick rotation — only while key is held (for controlled landings)
-    if (this.currentTrick === 'spin-left') {
-      if (input.steer < 0) this.spinAngle += SPIN_SPEED * dt;
-    } else if (this.currentTrick === 'spin-right') {
-      if (input.steer > 0) this.spinAngle -= SPIN_SPEED * dt;
-    } else if (this.currentTrick === 'frontflip') {
-      if (input.accelerate > 0) this.flipAngle -= FLIP_SPEED * dt;
-    } else if (this.currentTrick === 'backflip') {
-      if (input.accelerate < 0) this.flipAngle += FLIP_SPEED * dt;
+    if (manualInput !== 0) {
+      railRide.manualDistance += traveled;
+    }
+
+    this.manualTilt = lerp(this.manualTilt, manualTarget, tiltT);
+    this.boardLean = 0;
+    this.snowContact = 0;
+
+    const reachedRailEnd = this.position.z <= railRide.endZ + 1e-3;
+    if (reachedRailEnd) {
+      this.releaseRail(terrainManager);
+      this.updateTransientEffects(dt);
+      this.syncMeshTransform();
+      this.updatePose(dt);
+      this.updateBoardFeedback(dt);
+      return;
+    }
+
+    this.updateTransientEffects(dt);
+    this.mesh.position.copy(this.position);
+    this.mesh.rotation.set(this.manualTilt, this.spinAngle, 0);
+    this.updatePose(dt);
+    this.updateBoardFeedback(dt);
+  }
+
+  private updateTransientEffects(dt: number) {
+    if (this.invulnerable) {
+      this.invulnerableTimer -= dt;
+      this.blinkTimer += dt;
+      this.mesh.visible = Math.sin(this.blinkTimer * 15) > 0;
+      if (this.invulnerableTimer <= 0) {
+        this.invulnerable = false;
+        this.mesh.visible = true;
+      }
+    }
+
+    if (this.trickFlashTimer > 0) {
+      this.trickFlashTimer -= dt;
+      if (this.trickFlashTimer <= 0) {
+        this.pendingTrickName = null;
+      }
     }
   }
 
-  private handleLanding(_input: InputState) {
-    if (this.currentTrick) {
-      const isSpin = this.currentTrick === 'spin-left' || this.currentTrick === 'spin-right';
-      const angle = isSpin
-        ? this.spinAngle - this.trickStartSteerAngle
-        : this.flipAngle;
-      const absAngle = Math.abs(angle);
+  private syncMeshTransform() {
+    this.mesh.position.copy(this.position);
 
-      if (isSpin) {
+    if (this.airborne && this.hasAirTrick) {
+      this.mesh.rotation.set(this.flipAngle, this.spinAngle, 0);
+      return;
+    }
+
+    if (this.railRide) {
+      this.mesh.rotation.set(this.manualTilt, this.spinAngle, 0);
+      return;
+    }
+
+    this.mesh.rotation.y = -this.boardAngle;
+    this.mesh.rotation.x = 0;
+    this.mesh.rotation.z = this.boardLean;
+  }
+
+  private sampleRailTopY(z: number, railRide: RailRideState): number {
+    const span = Math.max(0.001, railRide.startZ - railRide.endZ);
+    const t = clamp((railRide.startZ - z) / span, 0, 1);
+    return lerp(railRide.startTopY, railRide.endTopY, t);
+  }
+
+  private releaseRail(terrainManager: TerrainManager) {
+    const railRide = this.railRide;
+    if (!railRide) {
+      return;
+    }
+
+    const halfTurns = Math.floor(Math.abs(this.spinAngle - railRide.spinAngleStart) / Math.PI);
+    const rawPoints =
+      railRide.distance * RAIL_SCORE_GRIND_PER_METER +
+      railRide.manualDistance * RAIL_SCORE_MANUAL_PER_METER +
+      railRide.spinDistance * RAIL_SCORE_SPIN_PER_METER +
+      halfTurns * RAIL_SPIN_HALF_ROTATION_BONUS;
+    const points = Math.floor(rawPoints * railRide.entryMultiplier);
+
+    if (points > 0) {
+      this.trickScore += points;
+      this.pendingTrickName = this.buildRailComboName(railRide, halfTurns, points);
+      this.trickFlashTimer = 2;
+      this.flashBoard(FB_GREEN);
+    }
+
+    this.boardAngle = wrapAngle(-this.spinAngle);
+    this.railRide = null;
+    this.manualTilt = 0;
+    this.railAttachCooldown = RAIL_ATTACH_COOLDOWN;
+    this.lockAirTrickInputs();
+    this.velocity.x = 0;
+    this.velocity.z = -this.speed * Math.cos(this.travelAngle);
+    this.settleOnGround(terrainManager);
+  }
+
+  private buildRailComboName(railRide: RailRideState, halfTurns: number, points: number): string {
+    const parts: string[] = [];
+    if (railRide.entryLabel) {
+      parts.push(railRide.entryLabel);
+    }
+    if (railRide.distance > 0.8) {
+      parts.push('Rail');
+    }
+    if (railRide.manualDistance > 0.8) {
+      parts.push('Manual');
+    }
+    if (halfTurns > 0) {
+      parts.push(`${halfTurns * 180} Spin`);
+    } else if (railRide.spinDistance > 0.8) {
+      parts.push('Spin');
+    }
+
+    return `${parts.length > 0 ? parts.join(' + ') : 'Rail Ride'} +${points}`;
+  }
+
+  private getRailEntryBonus() {
+    let multiplier = 1;
+    const labels: string[] = [];
+
+    if (this.currentSpinTrick) {
+      const angle = this.spinAngle - this.trickStartSteerAngle;
+      const absAngle = Math.abs(angle);
+      const halfRemainder = absAngle % Math.PI;
+      const cleanHalf = halfRemainder < LANDING_TOLERANCE ||
+        halfRemainder > (Math.PI - LANDING_TOLERANCE);
+      const halfRotations = Math.round(absAngle / Math.PI);
+
+      if (cleanHalf && halfRotations > 0) {
+        multiplier += halfRotations * RAIL_ENTRY_SPIN_MULTIPLIER_STEP;
+        labels.push(`${halfRotations * 180} In`);
+      }
+    }
+
+    if (this.currentFlipTrick) {
+      const absAngle = Math.abs(this.flipAngle);
+      const remainder = absAngle % (Math.PI * 2);
+      const deviation = remainder > Math.PI ? Math.PI * 2 - remainder : remainder;
+      const fullRotations = deviation < FLIP_CLEAN_ZONE
+        ? Math.round(absAngle / (Math.PI * 2))
+        : Math.floor(absAngle / (Math.PI * 2));
+
+      if (deviation < FLIP_CLEAN_ZONE && fullRotations > 0) {
+        multiplier += fullRotations * RAIL_ENTRY_FLIP_MULTIPLIER_STEP;
+        labels.push(`${fullRotations * 360} Flip In`);
+      }
+    }
+
+    const clampedMultiplier = clamp(multiplier, 1, RAIL_ENTRY_MULTIPLIER_CAP);
+    return {
+      multiplier: clampedMultiplier,
+      label: labels.length > 0 ? `${labels.join(' + ')} x${clampedMultiplier.toFixed(1)}` : null,
+    };
+  }
+
+  private settleOnGround(terrainManager: TerrainManager) {
+    const groundY = terrainManager.getHeightAt(this.position.x, this.position.z);
+    if (this.position.y > groundY + 0.18) {
+      this.airborne = true;
+      this.velocity.y = Math.min(this.velocity.y, 0);
+      return;
+    }
+
+    this.position.y = groundY;
+    this.velocity.y = 0;
+    this.airborne = false;
+    this.snowContact = 1;
+  }
+
+  private get hasAirTrick(): boolean {
+    return this.currentSpinTrick !== null || this.currentFlipTrick !== null;
+  }
+
+  private syncCurrentTrickState() {
+    this.currentTrick = this.currentSpinTrick ?? this.currentFlipTrick;
+  }
+
+  private resetAirTrickState() {
+    this.currentSpinTrick = null;
+    this.currentFlipTrick = null;
+    this.currentTrick = null;
+    this.spinAngle = 0;
+    this.flipAngle = 0;
+    this.manualTilt = 0;
+  }
+
+  private lockAirTrickInputs() {
+    this.trickInputLockSteer = true;
+    this.trickInputLockAccelerate = true;
+  }
+
+  // --- Trick system ---
+
+  private updateTricks(dt: number, input: InputState) {
+    if (Math.abs(input.steer) <= INPUT_NEUTRAL_THRESHOLD) {
+      this.trickInputLockSteer = false;
+    }
+    if (Math.abs(input.accelerate) <= INPUT_NEUTRAL_THRESHOLD) {
+      this.trickInputLockAccelerate = false;
+    }
+
+    if (input.steer < -INPUT_NEUTRAL_THRESHOLD && !this.currentSpinTrick && !this.trickInputLockSteer) {
+      this.currentSpinTrick = 'spin-left';
+      this.trickStartSteerAngle = -this.boardAngle;
+      this.spinAngle = -this.boardAngle;
+    } else if (input.steer > INPUT_NEUTRAL_THRESHOLD && !this.currentSpinTrick && !this.trickInputLockSteer) {
+      this.currentSpinTrick = 'spin-right';
+      this.trickStartSteerAngle = -this.boardAngle;
+      this.spinAngle = -this.boardAngle;
+    }
+
+    if (input.accelerate > INPUT_NEUTRAL_THRESHOLD && !this.currentFlipTrick && !this.trickInputLockAccelerate) {
+      this.currentFlipTrick = 'frontflip';
+      this.flipAngle = 0;
+      if (!this.currentSpinTrick) {
+        this.spinAngle = -this.boardAngle;
+      }
+    } else if (input.accelerate < -INPUT_NEUTRAL_THRESHOLD && !this.currentFlipTrick && !this.trickInputLockAccelerate) {
+      this.currentFlipTrick = 'backflip';
+      this.flipAngle = 0;
+      if (!this.currentSpinTrick) {
+        this.spinAngle = -this.boardAngle;
+      }
+    }
+
+    if (this.currentSpinTrick === 'spin-left' && input.steer < -INPUT_NEUTRAL_THRESHOLD) {
+      this.spinAngle += SPIN_SPEED * dt;
+    } else if (this.currentSpinTrick === 'spin-right' && input.steer > INPUT_NEUTRAL_THRESHOLD) {
+      this.spinAngle -= SPIN_SPEED * dt;
+    }
+
+    if (this.currentFlipTrick === 'frontflip' && input.accelerate > INPUT_NEUTRAL_THRESHOLD) {
+      this.flipAngle -= FLIP_SPEED * dt;
+    } else if (this.currentFlipTrick === 'backflip' && input.accelerate < -INPUT_NEUTRAL_THRESHOLD) {
+      this.flipAngle += FLIP_SPEED * dt;
+    }
+
+    this.syncCurrentTrickState();
+  }
+
+  private handleLanding(_input: InputState) {
+    if (this.hasAirTrick) {
+      let totalPoints = 0;
+      let speedMultiplier = 1;
+      let sloppy = false;
+      let badLanding = false;
+      const labels: string[] = [];
+
+      if (this.currentSpinTrick) {
+        const angle = this.spinAngle - this.trickStartSteerAngle;
+        const absAngle = Math.abs(angle);
         this.boardAngle = wrapAngle(-this.spinAngle);
 
-        // Spins: 180° increments are valid landings (180, 360, 540, etc.)
         const halfRemainder = absAngle % Math.PI;
         const cleanHalf = halfRemainder < LANDING_TOLERANCE ||
-                          halfRemainder > (Math.PI - LANDING_TOLERANCE);
+          halfRemainder > (Math.PI - LANDING_TOLERANCE);
         const halfRotations = Math.round(absAngle / Math.PI);
 
         if (cleanHalf && halfRotations > 0) {
           const points = Math.floor(TRICK_SCORE_SPIN * halfRotations * 0.5);
-          this.trickScore += points;
+          totalPoints += points;
           const degrees = halfRotations * 180;
-          const label = this.currentTrick === 'spin-left' ? 'Left Spin' : 'Right Spin';
-          this.pendingTrickName = `${degrees}° ${label} +${points}`;
-          this.trickFlashTimer = 2.0;
-          this.flashBoard(FB_GREEN);
+          const label = this.currentSpinTrick === 'spin-left' ? 'Left Spin' : 'Right Spin';
+          labels.push(`${degrees}° ${label}`);
         } else if (halfRotations > 0) {
           const wrongness = Math.sin(halfRemainder);
-          this.speed *= (1 - wrongness * 0.5);
-          this.pendingTrickName = 'SLOPPY!';
-          this.trickFlashTimer = 1.5;
-          this.flashBoard(FB_YELLOW);
+          speedMultiplier *= 1 - wrongness * 0.5;
+          sloppy = true;
         }
-      } else {
-        // Flips: forgiving landing based on how close to upright
-        // deviation: 0 = flat/upright, PI = upside-down
+      }
+
+      if (this.currentFlipTrick) {
+        const absAngle = Math.abs(this.flipAngle);
         const remainder = absAngle % (Math.PI * 2);
         const deviation = remainder > Math.PI ? Math.PI * 2 - remainder : remainder;
         const fullRotations = deviation < FLIP_CLEAN_ZONE
@@ -481,39 +753,45 @@ export class Player {
           : Math.floor(absAngle / (Math.PI * 2));
 
         if (deviation < FLIP_CLEAN_ZONE) {
-          // Clean zone (within ±45° of flat) — award points
           if (fullRotations > 0) {
             const points = TRICK_SCORE_FLIP * fullRotations;
-            this.trickScore += points;
+            totalPoints += points;
             const rotName = fullRotations === 1 ? '360' :
-                            fullRotations === 2 ? '720' :
-                            fullRotations === 3 ? '1080' : `${fullRotations * 360}`;
-            const label = this.currentTrick === 'frontflip' ? 'Frontflip' : 'Backflip';
-            this.pendingTrickName = `${rotName} ${label} +${points}`;
-            this.trickFlashTimer = 2.0;
-            this.flashBoard(FB_GREEN);
+              fullRotations === 2 ? '720' :
+              fullRotations === 3 ? '1080' : `${fullRotations * 360}`;
+            const label = this.currentFlipTrick === 'frontflip' ? 'Frontflip' : 'Backflip';
+            labels.push(`${rotName} ${label}`);
           }
-          // If no full rotations but close to flat — no penalty, just landed
         } else if (deviation < FLIP_DAMAGE_ZONE) {
-          // Sloppy zone (45°–135° from flat) — proportional slowdown, no damage
           const wrongness = (deviation - FLIP_CLEAN_ZONE) / (FLIP_DAMAGE_ZONE - FLIP_CLEAN_ZONE);
-          this.speed *= (1 - wrongness * 0.5);
-          this.pendingTrickName = 'SLOPPY!';
-          this.trickFlashTimer = 1.5;
-          this.flashBoard(FB_YELLOW);
+          speedMultiplier *= 1 - wrongness * 0.5;
+          sloppy = true;
         } else {
-          // Danger zone (135°–180° from flat = nearly upside-down) — crash
-          this.hit();
-          this.pendingTrickName = 'BAD LANDING!';
-          this.trickFlashTimer = 1.5;
-          this.flashBoard(FB_RED);
+          badLanding = true;
         }
       }
 
-      // Reset trick state
-      this.currentTrick = null;
-      this.spinAngle = 0;
-      this.flipAngle = 0;
+      if (speedMultiplier < 1) {
+        this.speed *= speedMultiplier;
+      }
+
+      if (badLanding) {
+        this.hit();
+        this.pendingTrickName = 'BAD LANDING!';
+        this.trickFlashTimer = 1.5;
+        this.flashBoard(FB_RED);
+      } else if (totalPoints > 0) {
+        this.trickScore += totalPoints;
+        this.pendingTrickName = `${labels.join(' + ')} +${totalPoints}`;
+        this.trickFlashTimer = 2.0;
+        this.flashBoard(FB_GREEN);
+      } else if (sloppy) {
+        this.pendingTrickName = 'SLOPPY!';
+        this.trickFlashTimer = 1.5;
+        this.flashBoard(FB_YELLOW);
+      }
+
+      this.resetAirTrickState();
     }
 
     // Pump absorb on landing — green flash for good absorption
@@ -526,16 +804,53 @@ export class Player {
   }
 
   hit() {
-    if (this.invulnerable) return;
-    this.health--;
-    this.speed *= 0.3;
-    this.invulnerable = true;
-    this.invulnerableTimer = this.invulnerableDuration;
-    this.blinkTimer = 0;
-    this.flashBoard(FB_RED);
+    this.damage(1);
+  }
+
+  attachToRail(obstacle: ObstacleData) {
+    if (!obstacle.rail || this.railAttachCooldown > 0) {
+      return;
+    }
+
+    if (this.railRide?.obstacle === obstacle) {
+      return;
+    }
+
+    const entryBonus = this.airborne ? this.getRailEntryBonus() : { multiplier: 1, label: null };
+    this.railRide = {
+      obstacle,
+      startZ: obstacle.rail.startZ,
+      endZ: obstacle.rail.endZ,
+      centerX: obstacle.rail.centerX,
+      startTopY: obstacle.rail.startTopY,
+      endTopY: obstacle.rail.endTopY,
+      distance: 0,
+      manualDistance: 0,
+      spinDistance: 0,
+      spinAngleStart: -this.boardAngle,
+      entryMultiplier: entryBonus.multiplier,
+      entryLabel: entryBonus.label,
+    };
+    this.airborne = false;
+    this.currentSpinTrick = null;
+    this.currentFlipTrick = null;
+    this.currentTrick = null;
+    this.flipAngle = 0;
+    this.spinAngle = -this.boardAngle;
+    this.manualTilt = 0;
+    this.isPumping = false;
+    this.absorbedLanding = false;
+    this.pumpSlopeAccum = 0;
+    this.velocity.set(0, 0, -this.speed);
+    this.position.x = obstacle.rail.centerX;
+    this.position.z = clamp(this.position.z, obstacle.rail.endZ, obstacle.rail.startZ);
+    this.position.y = this.sampleRailTopY(this.position.z, this.railRide);
+    this.snowContact = 0;
   }
 
   private startOutOfBoundsFall() {
+    this.railRide = null;
+    this.manualTilt = 0;
     this.outOfBoundsTimer = OUT_OF_BOUNDS_FALL_TIME;
     this.airborne = true;
     this.snowContact = 0;
@@ -543,16 +858,14 @@ export class Player {
     this.isPumping = false;
     this.absorbedLanding = false;
     this.pumpSlopeAccum = 0;
-    this.currentTrick = null;
-    this.spinAngle = 0;
-    this.flipAngle = 0;
+    this.resetAirTrickState();
     this.pendingTrickName = 'OUT OF BOUNDS!';
     this.trickFlashTimer = 1.5;
     this.flashBoard(FB_RED);
   }
 
   launch(force: number) {
-    if (!this.airborne) {
+    if (!this.airborne && !this.railRide) {
       this.velocity.y = force;
       this.airborne = true;
       this.flashBoard(FB_CYAN);
@@ -568,6 +881,8 @@ export class Player {
     let target: PoseTargets;
     if (this.airborne) {
       target = POSE_AIRBORNE;
+    } else if (this.railRide || Math.abs(this.manualTilt) > 0.08) {
+      target = POSE_CROUCHING;
     } else if (this.isPumping) {
       target = POSE_CROUCHING;
     } else {
@@ -658,12 +973,83 @@ export class Player {
     );
   }
 
+  getLabelAnchorPosition(target = new THREE.Vector3()): THREE.Vector3 {
+    const head = this.rig?.head;
+    this.mesh.updateWorldMatrix(true, false);
+
+    if (head) {
+      head.getWorldPosition(target);
+      target.y += 0.45;
+      return target;
+    }
+
+    return target.copy(this.position).add(new THREE.Vector3(0, 1.9, 0));
+  }
+
+  placeAt(x: number, y: number, z: number) {
+    this.position.set(x, y, z);
+    this.railRide = null;
+    this.manualTilt = 0;
+    this.trickInputLockSteer = false;
+    this.trickInputLockAccelerate = false;
+    this.mesh.position.copy(this.position);
+    this.runStartZ = z;
+  }
+
+  relocateTo(x: number, y: number, z: number, speed = this.speed, boardAngle = 0) {
+    this.position.set(x, y, z);
+    this.velocity.set(0, 0, 0);
+    this.speed = clamp(speed, this.minSpeed, this.maxSpeed);
+    this.boardAngle = boardAngle;
+    this.airborne = false;
+    this.railRide = null;
+    this.railAttachCooldown = 0;
+    this.trickInputLockSteer = false;
+    this.trickInputLockAccelerate = false;
+    this.outOfBoundsTimer = 0;
+    this.isPumping = false;
+    this.absorbedLanding = false;
+    this.pumpSlopeAccum = 0;
+    this.resetAirTrickState();
+    this.manualTilt = 0;
+    this.boardLean = 0;
+    this.carveIntensity = 0;
+    this.carveSign = 0;
+    this.snowContact = 1;
+    this.invulnerable = true;
+    this.invulnerableTimer = 0.8;
+    this.blinkTimer = 0;
+    this.mesh.visible = true;
+    this.mesh.position.copy(this.position);
+    this.mesh.rotation.set(0, -this.boardAngle, 0);
+    this.pendingTrickName = null;
+    this.trickFlashTimer = 0;
+  }
+
+  damage(amount = 1) {
+    if (this.invulnerable || amount <= 0) return;
+    this.railRide = null;
+    this.resetAirTrickState();
+    this.railAttachCooldown = RAIL_ATTACH_COOLDOWN;
+    this.lockAirTrickInputs();
+    this.health = Math.max(0, this.health - amount);
+    this.speed *= 0.3;
+    this.invulnerable = true;
+    this.invulnerableTimer = this.invulnerableDuration;
+    this.blinkTimer = 0;
+    this.flashBoard(FB_RED);
+  }
+
   reset() {
     this.position.set(0, 0, 0);
     this.velocity.set(0, 0, 0);
     this.speed = 10;
     this.boardAngle = 0;
     this.airborne = false;
+    this.railRide = null;
+    this.railAttachCooldown = 0;
+    this.trickInputLockSteer = false;
+    this.trickInputLockAccelerate = false;
     this.health = 3;
     this.invulnerable = false;
     this.outOfBoundsTimer = 0;
@@ -671,9 +1057,7 @@ export class Player {
     this.absorbedLanding = false;
     this.lastSlope = 0;
     this.pumpSlopeAccum = 0;
-    this.currentTrick = null;
-    this.spinAngle = 0;
-    this.flipAngle = 0;
+    this.resetAirTrickState();
     this.trickScore = 0;
     this.pendingTrickName = null;
     this.trickFlashTimer = 0;
@@ -685,6 +1069,7 @@ export class Player {
     this.mesh.scale.set(1, 1, 1);
     this.mesh.position.set(0, 0, 0);
     this.mesh.rotation.set(0, 0, 0);
+    this.runStartZ = 0;
 
     // Reset board feedback
     this.flashIntensity = 0;

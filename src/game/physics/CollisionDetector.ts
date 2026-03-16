@@ -17,13 +17,16 @@ export class CollisionDetector {
     const playerBox = player.getBoundingBox();
 
     for (const obstacle of obstacles) {
-      // Quick distance pre-filter
-      const dist = player.position.distanceTo(obstacle.mesh.position);
-      if (dist > 8) continue;
-
       const obsPos = obstacle.mesh.position;
-      const scale = obstacle.mesh.scale.x;
-      _halfVec.copy(obstacle.boundingSize).multiplyScalar(scale);
+      _halfVec.set(
+        obstacle.boundingSize.x * obstacle.mesh.scale.x,
+        obstacle.boundingSize.y * obstacle.mesh.scale.y,
+        obstacle.boundingSize.z * obstacle.mesh.scale.z,
+      );
+
+      // Quick distance pre-filter
+      const dist = player.position.distanceTo(obsPos);
+      if (dist > 8 + Math.max(_halfVec.x, _halfVec.z)) continue;
 
       _obsBox.min.copy(obsPos).sub(_halfVec);
       _obsBox.max.copy(obsPos).add(_halfVec);
@@ -37,6 +40,21 @@ export class CollisionDetector {
         continue;
       }
 
+      if (obstacle.type === 'rail') {
+        if (!obstacle.rail) continue;
+
+        const railTopMin = Math.min(obstacle.rail.startTopY, obstacle.rail.endTopY);
+        const railTopMax = Math.max(obstacle.rail.startTopY, obstacle.rail.endTopY);
+        const nearRailTop =
+          player.position.y >= railTopMin - 0.6 &&
+          player.position.y <= railTopMax + 1.5;
+
+        if (playerBox.intersectsBox(_obsBox) && nearRailTop && player.velocity.y <= 2.5) {
+          player.attachToRail(obstacle);
+        }
+        continue;
+      }
+
       // Trees and rocks deal damage
       if (playerBox.intersectsBox(_obsBox)) {
         return { hit: true, obstacle };
@@ -44,5 +62,13 @@ export class CollisionDetector {
     }
 
     return { hit: false };
+  }
+
+  checkRacerCollision(a: Player, b: Player): boolean {
+    if (a.health <= 0 || b.health <= 0) return false;
+
+    const aBox = a.getBoundingBox();
+    const bBox = b.getBoundingBox();
+    return aBox.intersectsBox(bBox);
   }
 }
